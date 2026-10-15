@@ -36,7 +36,7 @@ USER_AGENT = (
 # O sandbox do MegaSource bloqueia o módulo os.
 TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
 
-BASE_URL = "https://v1.watchplay.shop"
+BASE_URL = "https://v2.watchplay.shop"
 TIMEOUT = 20
 
 _cookiejar = http.cookiejar.CookieJar()
