@@ -1,30 +1,28 @@
 # -*- coding: utf-8 -*-
-"""
-MegaSource - WatchPlay scraper atualizado.
+"""MegaSource - WatchPlay scraper (v1.3.0).
 
-Protocolo:
-    TITLE, VERSION, DESCRIPTION
-    get_streams(media_type, media_id, config=None) -> list[dict]
+A origem exige Referer e Origin também nas requisições HLS. O Stremio
+recebe esses cabeçalhos por behaviorHints.proxyHeaders.
 
-IDs aceitos:
-    Filme:  tt0111161
-    Série:  tt0944947:1:1
-
-O WatchPlay atual inicializa o player diretamente no HTML através de
-createMyPlayer({ url: "...playlist.m3u8" }). Este scraper extrai esse URL,
-em vez de procurar a estrutura antiga players_select_container/data-id.
+Variáveis de ambiente opcionais:
+    TMDB_API_KEY          chave da API do TMDB
+    WATCHPLAY_BASE_URL    domínio base do WatchPlay
+    WATCHPLAY_VALIDATE    "1" para validar o M3U8 antes de retornar
 """
 
 import http.cookiejar
 import json
 import logging
+import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+
 TITLE = "WatchPlay Scraper"
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 DESCRIPTION = "Filmes e séries dublados do WatchPlay"
 
 USER_AGENT = (
@@ -33,11 +31,31 @@ USER_AGENT = (
     "Chrome/131.0 Safari/537.36"
 )
 
-# O sandbox do MegaSource bloqueia o módulo os.
-TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
+TMDB_API_KEY = os.getenv(
+    "TMDB_API_KEY",
+    "1865f43a0549ca50d341dd9ab8b29f49",
+)
 
-BASE_URL = "https://v2.watchplay.shop"
+BASE_URL = os.getenv(
+    "WATCHPLAY_BASE_URL",
+    "https://v2.watchplay.shop",
+).rstrip("/")
+
+VALIDATE_M3U8 = os.getenv("WATCHPLAY_VALIDATE", "0") == "1"
+
 TIMEOUT = 20
+RETRIES = 2
+VALIDATE_MAX_BYTES = 64 * 1024
+
+TMDB_CACHE_TTL = 24 * 60 * 60
+STREAM_CACHE_TTL = 5 * 60
+
+IMDB_RE = re.compile(r"tt\d+")
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
 
 _cookiejar = http.cookiejar.CookieJar()
 _opener = urllib.request.build_opener(
@@ -45,7 +63,8 @@ _opener = urllib.request.build_opener(
 )
 
 
-def _request(url, method="GET", data=None, headers=None):
+def _request(url, method="GET", data=None, headers=None, max_bytes=None):
+    """Retorna (status, texto). Status 0 indica falha de rede."""
     request_headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
@@ -66,29 +85,45 @@ def _request(url, method="GET", data=None, headers=None):
         elif data is not None:
             body = data
 
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers=request_headers,
-        method=method.upper(),
-    )
+    status, text = 0, ""
 
-    try:
-        with _opener.open(req, timeout=TIMEOUT) as resp:
-            raw = resp.read()
-            charset = resp.headers.get_content_charset() or "utf-8"
-            return resp.status, raw.decode(charset, errors="replace")
+    for attempt in range(1, RETRIES + 1):
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers=request_headers,
+            method=method.upper(),
+        )
 
-    except urllib.error.HTTPError as exc:
         try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            body = ""
+            with _opener.open(req, timeout=TIMEOUT) as resp:
+                raw = resp.read(max_bytes) if max_bytes else resp.read()
+                charset = resp.headers.get_content_charset() or "utf-8"
+                return resp.status, raw.decode(charset, errors="replace")
 
-        return exc.code, body
+        except urllib.error.HTTPError as exc:
+            try:
+                text = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                text = ""
 
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return 0, ""
+            status = exc.code
+
+            # Só repete em erro de servidor
+            if status < 500:
+                return status, text
+
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logging.warning(
+                "Falha HTTP em %s (tentativa %d/%d): %s",
+                url, attempt, RETRIES, exc,
+            )
+            status, text = 0, ""
+
+        if attempt < RETRIES:
+            time.sleep(0.5 * attempt)
+
+    return status, text
 
 
 def _json_response(body):
@@ -99,19 +134,50 @@ def _json_response(body):
         return None
 
 
+# --------------------------------------------------------------------------
+# Cache simples em memória
+# --------------------------------------------------------------------------
+
+_cache = {}
+
+
+def _cache_get(key):
+    entry = _cache.get(key)
+
+    if not entry:
+        return None
+
+    expires_at, value = entry
+
+    if expires_at < time.time():
+        _cache.pop(key, None)
+        return None
+
+    return value
+
+
+def _cache_set(key, value, ttl):
+    _cache[key] = (time.time() + ttl, value)
+
+
+# --------------------------------------------------------------------------
+# TMDB
+# --------------------------------------------------------------------------
+
 def imdb_to_tmdb(imdb_id):
     if not isinstance(imdb_id, str):
         return None
 
     imdb_id = imdb_id.strip()
 
-    if not re.fullmatch(r"tt\d+", imdb_id):
+    if not IMDB_RE.fullmatch(imdb_id):
         return None
 
-    find_url = (
-        "https://api.themoviedb.org/3/find/"
-        + urllib.parse.quote(imdb_id)
-    )
+    cache_key = "tmdb:" + imdb_id
+    cached = _cache_get(cache_key)
+
+    if cached:
+        return cached
 
     query = urllib.parse.urlencode(
         {
@@ -121,7 +187,13 @@ def imdb_to_tmdb(imdb_id):
         }
     )
 
-    status, body = _request(find_url + "?" + query)
+    url = (
+        "https://api.themoviedb.org/3/find/"
+        + urllib.parse.quote(imdb_id)
+        + "?" + query
+    )
+
+    status, body = _request(url)
 
     if status != 200:
         logging.error("TMDB retornou HTTP %s", status)
@@ -132,10 +204,11 @@ def imdb_to_tmdb(imdb_id):
     if not data:
         return None
 
+    result = None
+
     if data.get("movie_results"):
         item = data["movie_results"][0]
-
-        return {
+        result = {
             "type": "movie",
             "tmdb_id": item.get("id"),
             "title": (
@@ -145,10 +218,9 @@ def imdb_to_tmdb(imdb_id):
             ),
         }
 
-    if data.get("tv_results"):
+    elif data.get("tv_results"):
         item = data["tv_results"][0]
-
-        return {
+        result = {
             "type": "tv",
             "tmdb_id": item.get("id"),
             "title": (
@@ -158,110 +230,199 @@ def imdb_to_tmdb(imdb_id):
             ),
         }
 
-    return None
+    if result:
+        _cache_set(cache_key, result, TMDB_CACHE_TTL)
 
+    return result
+
+
+# --------------------------------------------------------------------------
+# Extração do player
+# --------------------------------------------------------------------------
 
 def _decode_js_string(value):
-    """Decodifica o URL usado no objeto JavaScript do player."""
+    """Decodifica o conteúdo de uma string JS (sem as aspas externas)."""
+    value = value.replace("\\/", "/")
 
-    if len(value) >= 2:
-        if value[0] in ('"', "'") and value[-1] == value[0]:
-            value = value[1:-1]
+    try:
+        return json.loads('"' + value.replace('"', '\\"') + '"')
+    except ValueError:
+        return value
 
-    return value.replace("\\/", "/")
 
-
-def _extract_player_url(html):
-    """Extrai o URL do player atual do WatchPlay."""
-
-    if not html:
-        return ""
-
-    match = re.search(
-        r"createMyPlayer\s*\(\s*\{.*?\burl\s*:\s*([\"\'])(.*?)\1",
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    if not match:
-        match = re.search(
-            r"\burl\s*[:=]\s*([\"\'])(.*?)\1",
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-    if not match:
-        return ""
-
-    url = _decode_js_string(
-        '"' + match.group(2) + '"'
-    ).strip()
+def _normalize_url(raw):
+    url = _decode_js_string(raw).strip()
 
     if url.startswith("//"):
         url = "https:" + url
 
-    if not url.startswith(("http://", "https://")):
+    if url.startswith(("http://", "https://")):
+        return url
+
+    return ""
+
+
+_PLAYER_PATTERNS = [
+    # 1) createMyPlayer({ ... url: "..." })
+    re.compile(
+        r"createMyPlayer\s*\(\s*\{.*?\burl\s*:\s*([\"'])(.*?)\1",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    # 2) url: "..." / url = "..."
+    re.compile(
+        r"\burl\s*[:=]\s*([\"'])(.*?)\1",
+        re.IGNORECASE | re.DOTALL,
+    ),
+]
+
+_M3U8_FALLBACK = re.compile(
+    r"(https?:)?(?:\\?/){2}[^\"'\s<>]+?\.m3u8[^\"'\s<>]*",
+    re.IGNORECASE,
+)
+
+
+def _extract_player_url(html):
+    if not html:
         return ""
 
-    return url
+    for pattern in _PLAYER_PATTERNS:
+        for match in pattern.finditer(html):
+            url = _normalize_url(match.group(2))
+
+            if url:
+                return url
+
+    # Último recurso: qualquer .m3u8 solto no HTML
+    match = _M3U8_FALLBACK.search(html)
+
+    if match:
+        return _normalize_url(match.group(0))
+
+    return ""
 
 
-def _page_stream(url, referer):
-    status, body = _request(
-        url,
+def _validate_playlist(stream_url, page_url):
+    status, playlist = _request(
+        stream_url,
         headers={
-            "Referer": referer,
-            "sec-fetch-dest": "iframe",
-            "sec-fetch-mode": "navigate",
+            "Referer": page_url,
+            "Origin": BASE_URL,
+            "Accept": (
+                "application/vnd.apple.mpegurl,"
+                "application/x-mpegURL,*/*"
+            ),
+        },
+        max_bytes=VALIDATE_MAX_BYTES,
+    )
+
+    if status != 200 or not playlist.lstrip().startswith("#EXTM3U"):
+        logging.error(
+            "M3U8 inválido ou bloqueado: HTTP %s para %s",
+            status, stream_url,
+        )
+        return False
+
+    return True
+
+
+def _page_stream(page_url):
+    cached = _cache_get("stream:" + page_url)
+
+    if cached:
+        return cached
+
+    status, body = _request(
+        page_url,
+        headers={
+            "Referer": BASE_URL + "/",
+            "Accept": "text/html,application/xhtml+xml",
         },
     )
 
     if status != 200:
         logging.error(
-            "WatchPlay retornou HTTP %s para %s",
-            status,
-            url,
+            "WatchPlay retornou HTTP %s para %s", status, page_url
         )
         return ""
 
-    return _extract_player_url(body)
+    stream_url = _extract_player_url(body)
+
+    if not stream_url:
+        logging.error("M3U8 não encontrado em %s", page_url)
+        return ""
+
+    if VALIDATE_M3U8 and not _validate_playlist(stream_url, page_url):
+        return ""
+
+    _cache_set("stream:" + page_url, stream_url, STREAM_CACHE_TTL)
+
+    return stream_url
 
 
-def movie(imdb_id):
-    url = (
-        f"{BASE_URL}/movie/"
-        f"{urllib.parse.quote(imdb_id, safe='')}"
-    )
+# --------------------------------------------------------------------------
+# URLs das páginas
+# --------------------------------------------------------------------------
 
-    return _page_stream(url, url)
+def _movie_page_url(imdb_id):
+    return f"{BASE_URL}/movie/{urllib.parse.quote(imdb_id, safe='')}"
 
 
-def series(imdb_id, season, episode):
+def _series_page_url(imdb_id, season, episode):
     tmdb_info = imdb_to_tmdb(imdb_id)
 
     if not tmdb_info or not tmdb_info.get("tmdb_id"):
         return ""
 
-    url = (
-        f"{BASE_URL}/tvshow/"
-        f"{urllib.parse.quote(str(tmdb_info['tmdb_id']), safe='')}"
-        f"/{int(season)}/{int(episode)}"
-    )
+    tmdb_id = urllib.parse.quote(str(tmdb_info["tmdb_id"]), safe="")
 
-    return _page_stream(url, url)
+    return f"{BASE_URL}/tvshow/{tmdb_id}/{int(season)}/{int(episode)}"
+
+
+# --------------------------------------------------------------------------
+# API pública
+# --------------------------------------------------------------------------
+
+def movie(imdb_id):
+    if not isinstance(imdb_id, str) or not IMDB_RE.fullmatch(imdb_id.strip()):
+        return ""
+
+    return _page_stream(_movie_page_url(imdb_id.strip()))
+
+
+def series(imdb_id, season, episode):
+    if not isinstance(imdb_id, str) or not IMDB_RE.fullmatch(imdb_id.strip()):
+        return ""
+
+    page_url = _series_page_url(imdb_id.strip(), season, episode)
+
+    return _page_stream(page_url) if page_url else ""
 
 
 def _positive_int(value):
     try:
         number = int(str(value).strip())
-
-        if number > 0:
-            return number
-
-        return None
-
+        return number if number > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def _build_stream(stream_url, page_url, title):
+    return {
+        "name": TITLE,
+        "title": title,
+        "url": stream_url,
+        "behaviorHints": {
+            "notWebReady": False,
+            "notMyMetadata": True,
+            "proxyHeaders": {
+                "request": {
+                    "User-Agent": USER_AGENT,
+                    "Origin": BASE_URL,
+                    "Referer": page_url,
+                }
+            },
+        },
+    }
 
 
 def get_streams(media_type, media_id, config=None):
@@ -274,11 +435,11 @@ def get_streams(media_type, media_id, config=None):
     parts = media_id.strip().split(":")
     imdb_id = parts[0].strip()
 
-    if not re.fullmatch(r"tt\d+", imdb_id):
+    if not IMDB_RE.fullmatch(imdb_id):
         return []
 
     if media_type == "movie":
-        stream_url = movie(imdb_id)
+        page_url = _movie_page_url(imdb_id)
         title = "Dublado"
 
     else:
@@ -291,31 +452,16 @@ def get_streams(media_type, media_id, config=None):
         if season is None or episode is None:
             return []
 
-        stream_url = series(
-            imdb_id,
-            season,
-            episode,
-        )
+        page_url = _series_page_url(imdb_id, season, episode)
+
+        if not page_url:
+            return []
 
         title = f"Dublado S{season:02d}E{episode:02d}"
+
+    stream_url = _page_stream(page_url)
 
     if not stream_url:
         return []
 
-    return [
-        {
-            "name": TITLE,
-            "title": title,
-            "url": stream_url,
-            "behaviorHints": {
-                "notMyMetadata": True,
-                "proxyHeaders": {
-                    "request": {
-                        "User-Agent": USER_AGENT,
-                        "Origin": BASE_URL,
-                        "Referer": BASE_URL + "/",
-                    }
-                },
-            },
-        }
-    ]
+    return [_build_stream(stream_url, page_url, title)]
